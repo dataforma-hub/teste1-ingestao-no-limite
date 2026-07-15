@@ -2,7 +2,7 @@
 """
 Pipeline de ingestão — entrypoint do container (avaliação oficial).
 
-Lê /data/*.zip → transforma → filtra B2B → grava public.{PG_TABLE}
+Lê /data/*.zip → transforma → grava public.{PG_TABLE}
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import csv
 import io
 import os
 import re
-import sys
 import zipfile
 from pathlib import Path
 
@@ -38,30 +37,56 @@ PORTE_MAP = {
 
 CPF_TAIL = re.compile(r"\d{11}$")
 
+CAPITAL_FAIXA_MAP = [
+    (0, 0, "SEM CAPITAL"),
+    (0, 1000, "ATÉ 1K"),
+    (1000, 10000, "1K A 10K"),
+    (10000, 100000, "10K A 100K"),
+    (100000, 1000000, "100K A 1M"),
+    (1000000, float("inf"), "ACIMA DE 1M"),
+]
+
+NJ_GRUPO_MAP = {
+    "1": "ADMINISTRAÇÃO PÚBLICA",
+    "2": "ENTIDADES EMPRESARIAIS",
+    "3": "ENTIDADES SEM FINS LUCRATIVOS",
+    "4": "PESSOAS FÍSICAS",
+    "5": "ORGANIZAÇÕES INTERNACIONAIS",
+}
+
+
+def get_capital_faixa(capital: float) -> str:
+    for lo, hi, label in CAPITAL_FAIXA_MAP:
+        if lo < capital <= hi:
+            return label
+    return "SEM CAPITAL"
+
+
+def get_natureza_grupo(natureza: str) -> str:
+    return NJ_GRUPO_MAP.get(natureza[0], "OUTROS")
+
+
+def is_mei(razao: str) -> bool:
+    return bool(CPF_TAIL.search(razao))
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def parse_capital(raw: str) -> float | None:
+def parse_capital(raw: str) -> float:
     s = (raw or "").strip()
     if not s:
-        return None
-    # BR: 1.234.567,89  ou  1234567,89  ou  1234567.89
+        return 0.0
     if "," in s:
         s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
     except ValueError:
-        return None
+        return 0.0
 
 
-def transform_row(fields: list[str]) -> tuple | None:
-    """
-    Ordem EMPRECSV (Receita Federal):
-      0 cnpj_basico, 1 razao_social, 2 natureza_juridica,
-      3 qualificacao_responsavel, 4 capital_social, 5 porte, 6 ente_federativo
-    """
+def transform_row(fields: list[str], data_processamento: str) -> tuple | None:
     if len(fields) < 7:
         return None
 
@@ -70,9 +95,7 @@ def transform_row(fields: list[str]) -> tuple | None:
         return None
 
     razao = (fields[1] or "").strip().upper()
-    if not razao:
-        return None
-    if CPF_TAIL.search(razao):
+    if razao is None:
         return None
 
     natureza = re.sub(r"\D", "", fields[2] or "").zfill(4)[-4:]
@@ -84,15 +107,18 @@ def transform_row(fields: list[str]) -> tuple | None:
         return None
 
     capital = parse_capital(fields[4])
-    if capital is None or capital <= 1000.0:
-        return None
 
     porte = re.sub(r"\D", "", fields[5] or "").zfill(2)[-2:]
     if porte not in PORTE_MAP:
-        return None
+        porte = "00"
 
     ente = (fields[6] or "").strip()
-    ente = ente if ente else None
+    ente_clean = ente if ente else None
+
+    capital_faixa = get_capital_faixa(capital)
+    is_mei_flag = is_mei(razao)
+    nj_grupo = get_natureza_grupo(natureza)
+    ente_presente = ente_clean is not None
 
     return (
         cnpj,
@@ -102,11 +128,19 @@ def transform_row(fields: list[str]) -> tuple | None:
         capital,
         porte,
         PORTE_MAP[porte],
-        ente,
+        ente_clean,
+        capital_faixa,
+        is_mei_flag,
+        nj_grupo,
+        ente_presente,
+        data_processamento,
     )
 
 
 def iter_rows():
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat()
+
     zips = sorted(DATA_DIR.glob("*.zip"))
     if not zips:
         raise FileNotFoundError(f"Nenhum .zip em {DATA_DIR}")
@@ -125,7 +159,7 @@ def iter_rows():
                     text = io.TextIOWrapper(raw, encoding="iso-8859-1", newline="")
                     reader = csv.reader(text, delimiter=";", quotechar='"')
                     for fields in reader:
-                        row = transform_row(fields)
+                        row = transform_row(fields, ts)
                         if row is not None:
                             yield row
 
@@ -141,19 +175,24 @@ def connect():
 
 
 def prepare_table(conn) -> None:
-    # Aspas: participante pode ter hífen (ex.: dataforma-hub_empresas)
     ddl = f"""
     DROP TABLE IF EXISTS public."{PG_TABLE}";
     CREATE TABLE public."{PG_TABLE}" (
-        cnpj_basico              VARCHAR(8) NOT NULL,
-        razao_social             VARCHAR NOT NULL,
-        natureza_juridica        VARCHAR(4) NOT NULL,
-        qualificacao_responsavel VARCHAR NOT NULL,
-        capital_social           DOUBLE PRECISION NOT NULL,
-        porte_codigo             VARCHAR(2) NOT NULL,
-        porte_descricao          VARCHAR NOT NULL,
-        ente_federativo          VARCHAR
+        cnpj_basico                  VARCHAR(8) NOT NULL,
+        razao_social                 VARCHAR NOT NULL,
+        natureza_juridica             VARCHAR(4) NOT NULL,
+        qualificacao_responsavel      VARCHAR NOT NULL,
+        capital_social               DOUBLE PRECISION NOT NULL,
+        porte_codigo                 VARCHAR(2) NOT NULL,
+        porte_descricao              VARCHAR NOT NULL,
+        ente_federativo              VARCHAR,
+        capital_social_faixa         VARCHAR NOT NULL,
+        is_mei                       BOOLEAN NOT NULL,
+        natureza_juridica_grupo      VARCHAR NOT NULL,
+        ente_federativo_presente     BOOLEAN NOT NULL,
+        data_processamento           TIMESTAMP NOT NULL
     );
+    CREATE UNIQUE INDEX idx_cnpj_unique ON public."{PG_TABLE}" (cnpj_basico);
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
@@ -167,7 +206,9 @@ def flush_batch(conn, batch: list[tuple]) -> None:
         INSERT INTO public."{PG_TABLE}" (
             cnpj_basico, razao_social, natureza_juridica,
             qualificacao_responsavel, capital_social, porte_codigo,
-            porte_descricao, ente_federativo
+            porte_descricao, ente_federativo,
+            capital_social_faixa, is_mei, natureza_juridica_grupo,
+            ente_federativo_presente, data_processamento
         ) VALUES %s
     """
     with conn.cursor() as cur:
