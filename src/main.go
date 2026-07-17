@@ -217,6 +217,8 @@ func main() {
 		"data_processamento",
 	}
 
+	seen := make([]uint64, 100000000/64+1)
+
 	for _, zpPath := range zips {
 		log.Printf("Processando %s...", filepath.Base(zpPath))
 		zr, err := zip.OpenReader(zpPath)
@@ -244,8 +246,6 @@ func main() {
 			csvReader.Comma = ';'
 			csvReader.LazyQuotes = true
 			csvReader.FieldsPerRecord = -1
-			// csvReader.ReuseRecord = true // Não usar com CopyFrom que guarda referências para slice?
-			// CopyFromRows recebe uma cópia ou usa direto? Melhor usar slices recém-alocadas se batcharmos
 
 			var batch [][]any
 
@@ -255,7 +255,6 @@ func main() {
 					break
 				}
 				if err != nil {
-					// Pular linha inválida
 					continue
 				}
 
@@ -264,17 +263,22 @@ func main() {
 				}
 
 				cnpj := parseCnpj(record[0])
+				cnpjInt, err := strconv.Atoi(cnpj)
+				if err == nil {
+					idx := cnpjInt / 64
+					bit := uint64(1) << (cnpjInt % 64)
+					if (seen[idx] & bit) != 0 {
+						continue // skip duplicate
+					}
+					seen[idx] |= bit
+				}
+
 				razao := strings.ToUpper(strings.TrimSpace(record[1]))
 				natureza := parseNatureza(record[2])
 				qualificacao := strings.TrimSpace(record[3])
 				capital := parseCapital(record[4])
 				porte := parsePorte(record[5])
 				enteRaw := strings.TrimSpace(record[6])
-
-				if len(cnpj) != 8 || !nonDigitRegex.MatchString(cnpj) == false {
-					// Espera aí, regex retorna true se tiver não digito, mas parseCnpj já resolve isso e garante 8 digitos.
-				}
-				// parseCnpj returns padded 8 digits.
 
 				var ente *string
 				if enteRaw != "" {
@@ -317,7 +321,7 @@ func main() {
 					} else {
 						totalInserted += len(batch)
 					}
-					batch = batch[:0] // reseta o batch mantendo a capacidade
+					batch = batch[:0]
 				}
 			}
 
