@@ -1,14 +1,14 @@
-FROM python:3.11-slim
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
+COPY src/go.mod src/go.sum ./
+RUN go mod download
 
-ENV PYTHONUNBUFFERED=1
+COPY src/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -o /ingestao main.go
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /ingestao /app/ingestao
 
-COPY src/ ./src/
-
-# O avaliador executa apenas: docker run <sua-imagem>
-# Portanto o CMD deve disparar TODA a ingestão até gravar no Postgres.
-CMD ["python", "src/main.py"]
+CMD ["/app/ingestao"]
